@@ -1,0 +1,1094 @@
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const wiegine = require('fca-mafiya');
+const WebSocket = require('ws');
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+let config = {
+  delay: 10,
+  running: false,
+  currentCookieIndex: 0,
+  cookies: [],
+  rotationMode: 'round-robin', // 'round-robin', 'random', 'load-balance'
+  autoRecovery: true,
+  maxRetries: 3
+};
+
+let messageData = {
+  threadID: '',
+  messages: [],
+  currentIndex: 0,
+  loopCount: 0,
+  hatersName: [],
+  lastName: [],
+  stats: {
+    totalSent: 0,
+    totalFailed: 0,
+    sessionStats: {}
+  }
+};
+
+let wss;
+
+class EnhancedSessionManager {
+  constructor() {
+    this.sessions = new Map(); // Map of index -> {api, healthy, stats, lastUsed}
+    this.sessionQueue = []; // Queue of healthy session indices
+    this.currentSessionIndex = 0;
+    this.retryQueue = new Map(); // Failed sessions to retry
+  }
+
+  async createSession(cookieContent, index) {
+    return new Promise((resolve) => {
+      console.log(`🔐 Creating session ${index + 1}/${config.cookies.length}...`);
+      
+      const cookieData = this.parseCookie(cookieContent);
+      
+      wiegine.login(cookieData, { 
+        logLevel: "silent",
+        forceLogin: true,
+        selfListen: false,
+        updatePresence: false,
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      }, (err, api) => {
+        if (err || !api) {
+          console.log(`❌ Session ${index + 1} failed:`, err?.error || 'Unknown error');
+          
+          this.sessions.set(index, { 
+            api: null, 
+            healthy: false, 
+            error: err?.error,
+            stats: { sent: 0, failed: 0 },
+            lastUsed: null,
+            retryCount: 0
+          });
+          
+          // Add to retry queue if auto-recovery is enabled
+          if (config.autoRecovery && (!this.sessions.get(index) || this.sessions.get(index).retryCount < config.maxRetries)) {
+            this.retryQueue.set(index, Date.now() + 30000); // Retry after 30s
+          }
+          
+          resolve(null);
+          return;
+        }
+
+        console.log(`✅ Session ${index + 1} logged in successfully`);
+        
+        // Test group access before marking as healthy
+        this.testGroupAccess(api, index).then((canAccess) => {
+          if (canAccess) {
+            this.sessions.set(index, { 
+              api, 
+              healthy: true, 
+              stats: { sent: 0, failed: 0 },
+              lastUsed: null,
+              retryCount: 0,
+              createdAt: Date.now()
+            });
+            this.sessionQueue.push(index);
+            console.log(`🎯 Session ${index + 1} added to rotation pool`);
+            messageData.stats.sessionStats[index] = { sent: 0, failed: 0 };
+          } else {
+            console.log(`⚠️ Session ${index + 1} cannot access target group`);
+            this.sessions.set(index, { 
+              api, 
+              healthy: false, 
+              error: 'No group access',
+              stats: { sent: 0, failed: 0 },
+              lastUsed: null,
+              retryCount: 0
+            });
+          }
+          resolve(api);
+        });
+      });
+    });
+  }
+
+  parseCookie(cookieContent) {
+    // Handle both raw cookie string and JSON format
+    if (cookieContent.trim().startsWith('[') || cookieContent.trim().startsWith('{')) {
+      try {
+        return JSON.parse(cookieContent);
+      } catch (e) {
+        console.log('⚠️ Failed to parse as JSON, using as raw cookie');
+      }
+    }
+    return cookieContent;
+  }
+
+  async testGroupAccess(api, index) {
+    return new Promise((resolve) => {
+      // First try: Get thread info
+      api.getThreadInfo(messageData.threadID, (err, info) => {
+        if (!err && info) {
+          console.log(`✅ Session ${index + 1} - Thread access verified`);
+          resolve(true);
+          return;
+        }
+
+        console.log(`⚠️ Session ${index + 1} - Thread info failed, trying test message...`);
+        
+        // Second try: Send test message
+        api.sendMessage("🧪", messageData.threadID, (err2) => {
+          if (!err2) {
+            console.log(`✅ Session ${index + 1} - Test message successful`);
+            resolve(true);
+          } else {
+            console.log(`❌ Session ${index + 1} - Cannot send to group:`, err2?.error);
+            resolve(false);
+          }
+        });
+      });
+    });
+  }
+
+  getNextSession() {
+    if (this.sessionQueue.length === 0) {
+      console.log('❌ No healthy sessions available');
+      return null;
+    }
+
+    let sessionIndex;
+
+    switch (config.rotationMode) {
+      case 'random':
+        // Random selection
+        sessionIndex = this.sessionQueue[Math.floor(Math.random() * this.sessionQueue.length)];
+        break;
+      
+      case 'load-balance':
+        // Use least-used session
+        sessionIndex = this.getLeastUsedSession();
+        break;
+      
+      case 'round-robin':
+      default:
+        // Round-robin rotation
+        sessionIndex = this.sessionQueue[this.currentSessionIndex];
+        this.currentSessionIndex = (this.currentSessionIndex + 1) % this.sessionQueue.length;
+        break;
+    }
+    
+    const session = this.sessions.get(sessionIndex);
+    if (session && session.healthy) {
+      session.lastUsed = Date.now();
+      return { api: session.api, index: sessionIndex };
+    }
+    
+    return null;
+  }
+
+  getLeastUsedSession() {
+    let leastUsed = this.sessionQueue[0];
+    let minUsage = this.sessions.get(leastUsed)?.stats.sent || 0;
+
+    for (const index of this.sessionQueue) {
+      const session = this.sessions.get(index);
+      if (session && session.stats.sent < minUsage) {
+        minUsage = session.stats.sent;
+        leastUsed = index;
+      }
+    }
+
+    return leastUsed;
+  }
+
+  markSessionUnhealthy(index, reason = 'Unknown') {
+    const session = this.sessions.get(index);
+    if (session) {
+      session.healthy = false;
+      session.error = reason;
+      session.retryCount = (session.retryCount || 0) + 1;
+      
+      // Remove from active queue
+      const queueIndex = this.sessionQueue.indexOf(index);
+      if (queueIndex > -1) {
+        this.sessionQueue.splice(queueIndex, 1);
+      }
+      
+      console.log(`⚠️ Session ${index + 1} marked unhealthy: ${reason} (retry: ${session.retryCount})`);
+      
+      // Add to retry queue if under max retries
+      if (config.autoRecovery && session.retryCount < config.maxRetries) {
+        this.retryQueue.set(index, Date.now() + 60000); // Retry after 60s
+        console.log(`🔄 Session ${index + 1} will retry in 60 seconds`);
+      }
+    }
+  }
+
+  updateStats(index, success) {
+    const session = this.sessions.get(index);
+    if (session) {
+      if (success) {
+        session.stats.sent++;
+        messageData.stats.sessionStats[index].sent++;
+        messageData.stats.totalSent++;
+      } else {
+        session.stats.failed++;
+        messageData.stats.sessionStats[index].failed++;
+        messageData.stats.totalFailed++;
+      }
+    }
+  }
+
+  async processRetryQueue() {
+    const now = Date.now();
+    const toRetry = [];
+
+    for (const [index, retryTime] of this.retryQueue.entries()) {
+      if (now >= retryTime) {
+        toRetry.push(index);
+        this.retryQueue.delete(index);
+      }
+    }
+
+    for (const index of toRetry) {
+      console.log(`🔄 Retrying session ${index + 1}...`);
+      await this.createSession(config.cookies[index], index);
+    }
+  }
+
+  getHealthyCount() {
+    return this.sessionQueue.length;
+  }
+
+  getTotalSessions() {
+    return this.sessions.size;
+  }
+
+  getSessionDetails() {
+    const details = [];
+    for (const [index, session] of this.sessions) {
+      details.push({
+        id: index + 1,
+        healthy: session.healthy,
+        sent: session.stats.sent,
+        failed: session.stats.failed,
+        lastUsed: session.lastUsed ? new Date(session.lastUsed).toLocaleTimeString() : 'Never',
+        error: session.error || 'None',
+        retryCount: session.retryCount || 0
+      });
+    }
+    return details;
+  }
+}
+
+const sessionManager = new EnhancedSessionManager();
+
+class SmartMessageSender {
+  async sendMessage(api, message, threadID, sessionIndex) {
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        console.log(`⏱️ Session ${sessionIndex + 1} timed out`);
+        resolve({ success: false, reason: 'Timeout' });
+      }, 30000); // 30 second timeout
+
+      api.sendMessage(message, threadID, (err) => {
+        clearTimeout(timeout);
+        
+        if (!err) {
+          resolve({ success: true });
+          return;
+        }
+
+        const errorMsg = err.error || err.message || 'Unknown error';
+        console.log(`❌ Session ${sessionIndex + 1} send failed:`, errorMsg);
+        
+        resolve({ success: false, reason: errorMsg });
+      });
+    });
+  }
+
+  async sendMessageToGroup(finalMessage) {
+    const sessionData = sessionManager.getNextSession();
+    
+    if (!sessionData) {
+      console.log('❌ No healthy sessions available');
+      return { success: false, noSessions: true };
+    }
+
+    const { api, index } = sessionData;
+    
+    console.log(`📤 Using session ${index + 1}/${sessionManager.getTotalSessions()}`);
+    console.log(`📊 Session stats: ${sessionManager.sessions.get(index).stats.sent} sent, ${sessionManager.sessions.get(index).stats.failed} failed`);
+    
+    const result = await this.sendMessage(api, finalMessage, messageData.threadID, index);
+    
+    if (result.success) {
+      sessionManager.updateStats(index, true);
+      console.log(`✅ Message sent successfully via session ${index + 1}`);
+    } else {
+      sessionManager.updateStats(index, false);
+      sessionManager.markSessionUnhealthy(index, result.reason);
+      console.log(`❌ Message failed via session ${index + 1}: ${result.reason}`);
+    }
+    
+    return result;
+  }
+}
+
+const messageSender = new SmartMessageSender();
+
+async function mainLoop() {
+  if (!config.running) {
+    console.log('💤 System paused');
+    return;
+  }
+
+  try {
+    // Process retry queue
+    await sessionManager.processRetryQueue();
+
+    // Check healthy sessions
+    const healthyCount = sessionManager.getHealthyCount();
+    if (healthyCount === 0) {
+      console.log('🔄 No healthy sessions, recreating all...');
+      await initializeSessions();
+      setTimeout(mainLoop, 10000);
+      return;
+    }
+
+    // Message loop
+    if (messageData.currentIndex >= messageData.messages.length) {
+      messageData.loopCount++;
+      messageData.currentIndex = 0;
+      console.log(`\n🎯 Loop #${messageData.loopCount} completed`);
+      console.log(`📊 Total sent: ${messageData.stats.totalSent}, Failed: ${messageData.stats.totalFailed}`);
+      console.log(`🔄 Restarting from first message...\n`);
+    }
+
+    const rawMessage = messageData.messages[messageData.currentIndex];
+    const randomName = getRandomName();
+    const finalMessage = `${randomName} ${rawMessage}`;
+
+    console.log(`\n📝 Message ${messageData.currentIndex + 1}/${messageData.messages.length}`);
+    console.log(`💬 Content: ${finalMessage.substring(0, 50)}...`);
+    console.log(`🔢 Healthy sessions: ${healthyCount}/${sessionManager.getTotalSessions()}`);
+
+    const result = await messageSender.sendMessageToGroup(finalMessage);
+
+    if (result.success) {
+      messageData.currentIndex++;
+    } else if (result.noSessions) {
+      console.log('⚠️ Waiting for sessions to recover...');
+      setTimeout(mainLoop, 30000);
+      return;
+    }
+
+    // Next message delay
+    const delayMs = config.delay * 1000;
+    console.log(`⏰ Next message in ${config.delay} seconds...`);
+    setTimeout(mainLoop, delayMs);
+
+  } catch (error) {
+    console.log(`🛡️ Error: ${error.message}`);
+    setTimeout(mainLoop, 10000);
+  }
+}
+
+async function initializeSessions() {
+  console.log('\n🚀 Initializing multi-cookie sessions...');
+  console.log(`🍪 Total cookies: ${config.cookies.length}`);
+  console.log(`🔄 Rotation mode: ${config.rotationMode}`);
+  
+  // Create all sessions in parallel for faster startup
+  const promises = [];
+  for (let i = 0; i < config.cookies.length; i++) {
+    promises.push(sessionManager.createSession(config.cookies[i], i));
+  }
+  
+  await Promise.all(promises);
+  
+  const healthyCount = sessionManager.getHealthyCount();
+  const totalSessions = sessionManager.getTotalSessions();
+  
+  console.log(`\n✅ Session initialization complete:`);
+  console.log(`   - Healthy: ${healthyCount}`);
+  console.log(`   - Unhealthy: ${totalSessions - healthyCount}`);
+  console.log(`   - Success rate: ${((healthyCount/totalSessions)*100).toFixed(1)}%\n`);
+}
+
+function readRequiredFiles() {
+  try {
+    // Read cookies
+    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    if (!fs.existsSync(cookiesPath)) throw new Error('cookies.txt not found');
+    
+    const cookiesContent = fs.readFileSync(cookiesPath, 'utf8');
+    config.cookies = cookiesContent.split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0 && !line.startsWith('//'));
+
+    if (config.cookies.length === 0) throw new Error('No valid cookies found');
+
+    // Read thread ID
+    const convoPath = path.join(__dirname, 'convo.txt');
+    if (!fs.existsSync(convoPath)) throw new Error('convo.txt not found');
+    
+    messageData.threadID = fs.readFileSync(convoPath, 'utf8').trim();
+    if (!/^\d+$/.test(messageData.threadID)) {
+      throw new Error('Thread ID must be numeric');
+    }
+
+    // Read other required files
+    const hatersPath = path.join(__dirname, 'hatersanme.txt');
+    const lastnamePath = path.join(__dirname, 'lastname.txt');
+    const filePath = path.join(__dirname, 'File.txt');
+    const timePath = path.join(__dirname, 'time.txt');
+
+    [hatersPath, lastnamePath, filePath, timePath].forEach(file => {
+      if (!fs.existsSync(file)) throw new Error(`${path.basename(file)} not found`);
+    });
+
+    messageData.hatersName = fs.readFileSync(hatersPath, 'utf8')
+      .split('\n').map(l => l.trim()).filter(l => l);
+    messageData.lastName = fs.readFileSync(lastnamePath, 'utf8')
+      .split('\n').map(l => l.trim()).filter(l => l);
+    messageData.messages = fs.readFileSync(filePath, 'utf8')
+      .split('\n').map(l => l.trim()).filter(l => l);
+    
+    const timeContent = fs.readFileSync(timePath, 'utf8').trim();
+    config.delay = parseInt(timeContent) || 10;
+    
+    console.log('\n✅ Configuration loaded:');
+    console.log(`   📌 Thread ID: ${messageData.threadID}`);
+    console.log(`   🍪 Cookies: ${config.cookies.length}`);
+    console.log(`   💬 Messages: ${messageData.messages.length}`);
+    console.log(`   👤 Names: ${messageData.hatersName.length} first + ${messageData.lastName.length} last`);
+    console.log(`   ⏰ Delay: ${config.delay} seconds\n`);
+    
+    return true;
+  } catch (error) {
+    console.error('❌ Configuration error:', error.message);
+    return false;
+  }
+}
+
+function getRandomName() {
+  const randomHater = messageData.hatersName[Math.floor(Math.random() * messageData.hatersName.length)];
+  const randomLastName = messageData.lastName[Math.floor(Math.random() * messageData.lastName.length)];
+  return `${randomHater} ${randomLastName}`;
+}
+
+async function startSystem() {
+  console.log('\n🚀 Starting Enhanced Multi-Cookie Bot...');
+  
+  if (!readRequiredFiles()) {
+    console.log('❌ Failed to load configuration');
+    return;
+  }
+
+  config.running = true;
+  messageData.currentIndex = 0;
+  messageData.loopCount = 0;
+  messageData.stats = {
+    totalSent: 0,
+    totalFailed: 0,
+    sessionStats: {}
+  };
+
+  await initializeSessions();
+  
+  const healthyCount = sessionManager.getHealthyCount();
+  if (healthyCount > 0) {
+    console.log(`🎯 Starting message loop with ${healthyCount} active sessions`);
+    mainLoop();
+  } else {
+    console.log('❌ No healthy sessions available. System stopped.');
+    config.running = false;
+  }
+}
+
+function stopSystem() {
+  config.running = false;
+  console.log('\n⏹️ System stopped by user\n');
+}
+
+// Express API endpoints
+app.use(express.json());
+
+app.post('/api/start', (req, res) => {
+  startSystem();
+  res.json({ success: true, message: 'System started' });
+});
+
+app.post('/api/stop', (req, res) => {
+  stopSystem();
+  res.json({ success: true, message: 'System stopped' });
+});
+
+app.post('/api/config', (req, res) => {
+  const { rotationMode, delay, autoRecovery } = req.body;
+  
+  if (rotationMode) config.rotationMode = rotationMode;
+  if (delay) config.delay = parseInt(delay);
+  if (autoRecovery !== undefined) config.autoRecovery = autoRecovery;
+  
+  res.json({ success: true, config });
+});
+
+app.get('/api/status', (req, res) => {
+  const healthyCount = sessionManager.getHealthyCount();
+  const totalSessions = sessionManager.getTotalSessions();
+  const sessions = sessionManager.getSessionDetails();
+  
+  res.json({
+    running: config.running,
+    currentMessage: messageData.currentIndex + 1,
+    totalMessages: messageData.messages.length,
+    loopCount: messageData.loopCount,
+    healthySessions: healthyCount,
+    totalSessions: totalSessions,
+    delay: config.delay,
+    rotationMode: config.rotationMode,
+    autoRecovery: config.autoRecovery,
+    stats: messageData.stats,
+    sessions: sessions,
+    retryQueueSize: sessionManager.retryQueue.size
+  });
+});
+
+app.get('/api/sessions', (req, res) => {
+  const sessions = sessionManager.getSessionDetails();
+  res.json({ sessions });
+});
+
+app.get('/', (req, res) => {
+  res.send(`
+  <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Enhanced Multi-Cookie Bot</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+          }
+          body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+          }
+          .container {
+            max-width: 1200px;
+            margin: 0 auto;
+          }
+          .header {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 20px;
+            text-align: center;
+          }
+          .header h1 {
+            color: #667eea;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+          }
+          .header p {
+            color: #666;
+            font-size: 1.1em;
+          }
+          .controls {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 20px;
+          }
+          .btn-group {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+          }
+          button {
+            padding: 15px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            flex: 1;
+            min-width: 150px;
+          }
+          button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+          }
+          .btn-start {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+          }
+          .btn-stop {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+          }
+          .btn-refresh {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+          }
+          .settings {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+          }
+          .setting-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+          }
+          .setting-group label {
+            font-weight: 600;
+            color: #333;
+          }
+          .setting-group select,
+          .setting-group input {
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+          }
+          .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+          }
+          .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+          }
+          .stat-card h3 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 1.2em;
+          }
+          .stat-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid #f0f0f0;
+          }
+          .stat-item:last-child {
+            border-bottom: none;
+          }
+          .stat-label {
+            color: #666;
+            font-weight: 500;
+          }
+          .stat-value {
+            color: #333;
+            font-weight: 700;
+          }
+          .sessions-table {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            overflow-x: auto;
+          }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+          }
+          th {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+          }
+          td {
+            padding: 15px;
+            border-bottom: 1px solid #f0f0f0;
+          }
+          tr:hover {
+            background: #f8f9fa;
+          }
+          .status-badge {
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+          }
+          .status-healthy {
+            background: #d4edda;
+            color: #155724;
+          }
+          .status-unhealthy {
+            background: #f8d7da;
+            color: #721c24;
+          }
+          .running {
+            color: #28a745;
+            font-weight: bold;
+          }
+          .stopped {
+            color: #dc3545;
+            font-weight: bold;
+          }
+          @media (max-width: 768px) {
+            .header h1 {
+              font-size: 1.8em;
+            }
+            .btn-group {
+              flex-direction: column;
+            }
+            button {
+              min-width: 100%;
+            }
+            .stats-grid {
+              grid-template-columns: 1fr;
+            }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1>🚀 Enhanced Multi-Cookie Bot</h1>
+            <p>Advanced Facebook Messenger Automation with Session Management</p>
+          </div>
+
+          <div class="controls">
+            <div class="btn-group">
+              <button class="btn-start" onclick="start()">▶️ Start System</button>
+              <button class="btn-stop" onclick="stop()">⏹️ Stop System</button>
+              <button class="btn-refresh" onclick="updateAll()">🔄 Refresh Data</button>
+            </div>
+
+            <div class="settings">
+              <div class="setting-group">
+                <label>Rotation Mode</label>
+                <select id="rotationMode" onchange="updateConfig()">
+                  <option value="round-robin">Round Robin</option>
+                  <option value="random">Random</option>
+                  <option value="load-balance">Load Balance</option>
+                </select>
+              </div>
+              <div class="setting-group">
+                <label>Message Delay (seconds)</label>
+                <input type="number" id="delay" min="1" value="10" onchange="updateConfig()">
+              </div>
+              <div class="setting-group">
+                <label>Auto Recovery</label>
+                <select id="autoRecovery" onchange="updateConfig()">
+                  <option value="true">Enabled</option>
+                  <option value="false">Disabled</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="stats-grid">
+            <div class="stat-card">
+              <h3>📊 System Status</h3>
+              <div id="systemStatus"></div>
+            </div>
+            <div class="stat-card">
+              <h3>💬 Message Progress</h3>
+              <div id="messageStatus"></div>
+            </div>
+            <div class="stat-card">
+              <h3>🍪 Session Health</h3>
+              <div id="sessionHealth"></div>
+            </div>
+            <div class="stat-card">
+              <h3>📈 Statistics</h3>
+              <div id="statistics"></div>
+            </div>
+          </div>
+
+          <div class="sessions-table">
+            <h3 style="margin-bottom: 20px; color: #667eea;">🔐 Session Details</h3>
+            <table id="sessionsTable">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Status</th>
+                  <th>Sent</th>
+                  <th>Failed</th>
+                  <th>Success Rate</th>
+                  <th>Last Used</th>
+                  <th>Retries</th>
+                  <th>Error</th>
+                </tr>
+              </thead>
+              <tbody id="sessionsBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <script>
+          async function start() {
+            await fetch('/api/start', { method: 'POST' });
+            updateAll();
+          }
+
+          async function stop() {
+            await fetch('/api/stop', { method: 'POST' });
+            updateAll();
+          }
+
+          async function updateConfig() {
+            const config = {
+              rotationMode: document.getElementById('rotationMode').value,
+              delay: parseInt(document.getElementById('delay').value),
+              autoRecovery: document.getElementById('autoRecovery').value === 'true'
+            };
+            await fetch('/api/config', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(config)
+            });
+            updateAll();
+          }
+
+          async function updateAll() {
+            try {
+              const res = await fetch('/api/status');
+              const data = await res.json();
+
+              // System Status
+              document.getElementById('systemStatus').innerHTML = \`
+                <div class="stat-item">
+                  <span class="stat-label">Status:</span>
+                  <span class="stat-value \${data.running ? 'running' : 'stopped'}">\${data.running ? '✅ Running' : '⏹️ Stopped'}</span>
+                  div class="stat-item">
+                  <span class="stat-label">Rotation Mode:</span>
+                  <span class="stat-value">\${data.rotationMode}</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Auto Recovery:</span>
+                  <span class="stat-value">\${data.autoRecovery ? '✅ Enabled' : '❌ Disabled'}</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Retry Queue:</span>
+                  <span class="stat-value">\${data.retryQueueSize} sessions</span>
+                </div>
+              \`;
+
+              // Message Status
+              document.getElementById('messageStatus').innerHTML = \`
+                <div class="stat-item">
+                  <span class="stat-label">Current Message:</span>
+                  <span class="stat-value">\${data.currentMessage}/\${data.totalMessages}</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Loop Count:</span>
+                  <span class="stat-value">\${data.loopCount}</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Delay:</span>
+                  <span class="stat-value">\${data.delay}s</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Progress:</span>
+                  <span class="stat-value">\${((data.currentMessage/data.totalMessages)*100).toFixed(1)}%</span>
+                </div>
+              \`;
+
+              // Session Health
+              document.getElementById('sessionHealth').innerHTML = \`
+                <div class="stat-item">
+                  <span class="stat-label">Healthy Sessions:</span>
+                  <span class="stat-value" style="color: #28a745;">\${data.healthySessions}</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Unhealthy Sessions:</span>
+                  <span class="stat-value" style="color: #dc3545;">\${data.totalSessions - data.healthySessions}</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Total Cookies:</span>
+                  <span class="stat-value">\${data.totalSessions}</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Health Rate:</span>
+                  <span class="stat-value">\${data.totalSessions > 0 ? ((data.healthySessions/data.totalSessions)*100).toFixed(1) : 0}%</span>
+                </div>
+              \`;
+
+              // Statistics
+              const successRate = data.stats.totalSent + data.stats.totalFailed > 0 
+                ? ((data.stats.totalSent / (data.stats.totalSent + data.stats.totalFailed)) * 100).toFixed(1)
+                : 0;
+              
+              document.getElementById('statistics').innerHTML = \`
+                <div class="stat-item">
+                  <span class="stat-label">Total Sent:</span>
+                  <span class="stat-value" style="color: #28a745;">\${data.stats.totalSent}</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Total Failed:</span>
+                  <span class="stat-value" style="color: #dc3545;">\${data.stats.totalFailed}</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Success Rate:</span>
+                  <span class="stat-value">\${successRate}%</span>
+                </div>
+                <div class="stat-item">
+                  <span class="stat-label">Total Attempts:</span>
+                  <span class="stat-value">\${data.stats.totalSent + data.stats.totalFailed}</span>
+                </div>
+              \`;
+
+              // Sessions Table
+              let sessionsHTML = '';
+              if (data.sessions && data.sessions.length > 0) {
+                data.sessions.forEach(session => {
+                  const total = session.sent + session.failed;
+                  const successRate = total > 0 ? ((session.sent / total) * 100).toFixed(1) : 0;
+                  
+                  sessionsHTML += \`
+                    <tr>
+                      <td><strong>#\${session.id}</strong></td>
+                      <td>
+                        <span class="status-badge \${session.healthy ? 'status-healthy' : 'status-unhealthy'}">
+                          \${session.healthy ? '✅ Healthy' : '❌ Unhealthy'}
+                        </span>
+                      </td>
+                      <td style="color: #28a745; font-weight: 600;">\${session.sent}</td>
+                      <td style="color: #dc3545; font-weight: 600;">\${session.failed}</td>
+                      <td><strong>\${successRate}%</strong></td>
+                      <td>\${session.lastUsed}</td>
+                      <td>\${session.retryCount}</td>
+                      <td style="color: #666; font-size: 0.9em;">\${session.error}</td>
+                    </tr>
+                  \`;
+                });
+              } else {
+                sessionsHTML = '<tr><td colspan="8" style="text-align: center; color: #999;">No sessions available</td></tr>';
+              }
+              
+              document.getElementById('sessionsBody').innerHTML = sessionsHTML;
+
+              // Update settings from server
+              document.getElementById('rotationMode').value = data.rotationMode;
+              document.getElementById('delay').value = data.delay;
+              document.getElementById('autoRecovery').value = data.autoRecovery.toString();
+            } catch (error) {
+              console.error('Error updating status:', error);
+            }
+          }
+
+          // Auto-refresh every 3 seconds
+          setInterval(updateAll, 3000);
+          
+          // Initial load
+          updateAll();
+        </script>
+      </body>
+    </html>
+  `);
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  console.log(`🎯 Enhanced Multi-Cookie Bot Server Started`);
+  console.log(`🌐 URL: http://localhost:${PORT}`);
+  console.log(`📅 Date: ${new Date().toLocaleString()}`);
+  console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+  console.log(`🚀 AUTO-STARTING IN 3 SECONDS...\n`);
+  
+  setTimeout(() => {
+    startSystem();
+  }, 3000);
+});
+
+wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws) => {
+  console.log('🔌 WebSocket client connected');
+  
+  ws.on('message', (message) => {
+    console.log('📨 Received:', message);
+  });
+  
+  ws.on('close', () => {
+    console.log('🔌 WebSocket client disconnected');
+  });
+  
+  ws.on('error', (error) => {
+    console.log('⚠️ WebSocket error:', error.message);
+  });
+});
+
+// Broadcast updates to all WebSocket clients
+setInterval(() => {
+  if (wss && wss.clients.size > 0) {
+    const status = {
+      running: config.running,
+      healthySessions: sessionManager.getHealthyCount(),
+      totalSessions: sessionManager.getTotalSessions(),
+      currentMessage: messageData.currentIndex + 1,
+      totalMessages: messageData.messages.length,
+      stats: messageData.stats
+    };
+    
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        try {
+          client.send(JSON.stringify(status));
+        } catch (error) {
+          console.log('⚠️ WebSocket send error:', error.message);
+        }
+      }
+    });
+  }
+}, 5000);
+
+// Global error handlers
+process.on('uncaughtException', (error) => {
+  console.log('🛡️ Uncaught exception protected:', error.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.log('🛡️ Unhandled rejection protected:', reason);
+});
+
+process.on('SIGINT', () => {
+  console.log('\n\n🛑 Shutting down gracefully...');
+  config.running = false;
+  
+  if (server) {
+    server.close(() => {
+      console.log('✅ Server closed');
+      process.exit(0);
+    });
+  } else {
+    process.exit(0);
+  }
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n\n🛑 SIGTERM received, shutting down...');
+  config.running = false;
+  
+  if (server) {
+    server.close(() => {
+      console.log('✅ Server closed');
+      process.exit(0);
+    });
+  } else {
+    process.exit(0);
+  }
+});
+
+console.log('✅ Server initialized and protected');
+
+console.log('📝 Waiting for configuration files...\n');
+
